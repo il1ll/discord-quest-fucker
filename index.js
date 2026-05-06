@@ -15,7 +15,6 @@ const COLORS = {
     X: '\x1b[0m'
 };
 
-const time = () => `${COLORS.Y}${new Date().toLocaleTimeString()}${COLORS.X}`;
 const log = (c, m) => console.log(`${COLORS.Y}[${new Date().toLocaleTimeString()}]${COLORS.X} ${COLORS[c]}${m}${COLORS.X}`);
 
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) discord/1.0.9215 Chrome/138.0.7204.251 Electron/37.6.0 Safari/537.36';
@@ -117,6 +116,12 @@ const PLATFORMS = {
 };
 
 let CURRENT_PLATFORM = PLATFORMS.DESKTOP;
+let progressInterval = null;
+let currentProgressData = { questName: '', done: 0, need: 0, platformName: '', isVideo: false, lastUpdateTime: 0, lastDone: 0 };
+
+function getTasks(quest) {
+    return quest.config?.task_config?.tasks || quest.config?.task_config_v2?.tasks || null;
+}
 
 function getPlatformForTask(taskType) {
     if (taskType.includes('XBOX')) return PLATFORMS.XBOX;
@@ -136,6 +141,61 @@ function getPlatformName(taskType) {
 
 function getXSuperProperties(platform = CURRENT_PLATFORM) {
     return Buffer.from(JSON.stringify(platform)).toString('base64');
+}
+
+function getOrbsFromQuest(quest) {
+    try {
+        const rewards = quest.config?.rewards_config?.rewards;
+        if (!rewards || !rewards.length) return 0;
+        let totalOrbs = 0;
+        for (const reward of rewards) {
+            if (reward.orb_quantity) {
+                totalOrbs += reward.orb_quantity;
+            }
+        }
+        return totalOrbs;
+    } catch {
+        return 0;
+    }
+}
+
+function startProgressDisplay() {
+    if (progressInterval) return;
+    progressInterval = setInterval(() => {
+        const { questName, done, need, platformName, isVideo, lastUpdateTime, lastDone } = currentProgressData;
+        if (need > 0 && lastUpdateTime > 0) {
+            const time = new Date().toLocaleTimeString();
+            const elapsed = (Date.now() - lastUpdateTime) / 1000;
+            const incrementPerSec = isVideo ? (7 / 2) : (30 / 30);
+            const estimatedTotal = lastDone + Math.floor(elapsed * incrementPerSec);
+            const displayDone = Math.min(need, Math.max(done, estimatedTotal));
+            const percent = Math.floor((displayDone / need) * 100);
+            const barLength = 20;
+            const filledLength = Math.floor((displayDone / need) * barLength);
+            const bar = '█'.repeat(filledLength) + '░'.repeat(barLength - filledLength);
+            const type = isVideo ? '🎬' : '🎮';
+            process.stdout.write(`\r${COLORS.Y}[${time}]${COLORS.X} ${type} ${COLORS.W}${questName}${COLORS.X} ${COLORS.G}${bar}${COLORS.X} ${COLORS.C}${displayDone}/${need}${COLORS.X} ${COLORS.M}${percent}%${COLORS.X} ${COLORS.B}[${platformName}]${COLORS.X}`);
+        }
+    }, 500);
+}
+
+function stopProgressDisplay() {
+    if (progressInterval) {
+        clearInterval(progressInterval);
+        progressInterval = null;
+    }
+}
+
+function updateProgressData(questName, done, need, platformName, isVideo = false) {
+    currentProgressData = {
+        questName,
+        done: Math.min(done, need),
+        need,
+        platformName,
+        isVideo,
+        lastUpdateTime: Date.now(),
+        lastDone: Math.min(done, need)
+    };
 }
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -230,45 +290,54 @@ async function getFreshQuest(id) {
 async function runTaskParallel(q, task) {
     const questName = q.config.messages.quest_name;
     const id = q.id;
-    const need = q.config.task_config.tasks[task].target;
+    const tasks = getTasks(q);
+    const need = tasks[task].target;
     let done = q.user_status?.progress?.[task]?.value || 0;
-    let lastPrint = Date.now();
     
     const taskPlatform = getPlatformForTask(task);
     const platformName = getPlatformName(task);
+    const isVideo = task.includes('WATCH_VIDEO');
 
-    log('Y', `${COLORS.W}${questName}${COLORS.X} type: ${COLORS.M}${task}${COLORS.X} ${COLORS.B}[${platformName}]${COLORS.X}`);
+    updateProgressData(questName, done, need, platformName, isVideo);
+    startProgressDisplay();
 
-    if (task.includes('WATCH_VIDEO')) {
+    if (isVideo) {
         while (done < need) {
             try {
                 const r = await video(id, Math.min(need, done + 7 + Math.random()), taskPlatform);
                 done += 7;
-                if (Date.now() - lastPrint >= 10000) {
-                    console.log(`${COLORS.Y}[${new Date().toLocaleTimeString()}]${COLORS.X} ${COLORS.C}${COLORS.W}${questName}${COLORS.X} ${COLORS.G}${Math.min(done, need)}${COLORS.C}/${COLORS.Y}${need}${COLORS.C} remaining ${COLORS.M}${Math.max(0, need - done)}${COLORS.X} ${COLORS.B}[${platformName}]${COLORS.X}`);
-                    lastPrint = Date.now();
-                }
+                updateProgressData(questName, Math.min(done, need), need, platformName, isVideo);
                 if (r.completed_at) break;
-            } catch {}
+            } catch {
+                updateProgressData(questName, done, need, platformName, isVideo);
+            }
             await sleep(2000);
         }
     } else {
         while (done < need) {
             try {
                 const r = await heartbeat(id, q.config.application.id, false, taskPlatform);
-                done = r.progress?.[task]?.value || done;
-                if (Date.now() - lastPrint >= 10000) {
-                    console.log(`${COLORS.Y}[${new Date().toLocaleTimeString()}]${COLORS.X} ${COLORS.C}${COLORS.W}${questName}${COLORS.X} ${COLORS.G}${done}${COLORS.C}/${COLORS.Y}${need}${COLORS.C} remaining ${COLORS.M}${Math.max(0, need - done)}${COLORS.X} ${COLORS.B}[${platformName}]${COLORS.X}`);
-                    lastPrint = Date.now();
+                const newDone = r.progress?.[task]?.value || done;
+                if (newDone !== done) {
+                    done = newDone;
+                    updateProgressData(questName, done, need, platformName, isVideo);
                 }
                 if (r.completed_at) break;
-            } catch {}
+            } catch {
+                updateProgressData(questName, done, need, platformName, isVideo);
+            }
             await sleep(30000);
         }
         try {
             await heartbeat(id, q.config.application.id, true, taskPlatform);
         } catch {}
     }
+    
+    stopProgressDisplay();
+    updateProgressData(questName, need, need, platformName, isVideo);
+    const time = new Date().toLocaleTimeString();
+    const type = isVideo ? '🎬' : '🎮';
+    process.stdout.write(`\r${COLORS.Y}[${time}]${COLORS.X} ${type} ${COLORS.W}${questName}${COLORS.X} ${COLORS.G}${'█'.repeat(20)}${COLORS.X} ${COLORS.C}${need}/${need}${COLORS.X} ${COLORS.M}100%${COLORS.X} ${COLORS.B}[${platformName}]${COLORS.X}\n`);
 }
 
 function clearScreen() {
@@ -316,9 +385,12 @@ async function listQuests(quests) {
     
     quests.forEach((q, index) => {
         const name = q.config.messages.quest_name;
-        const tasks = Object.keys(q.config.task_config.tasks);
-        const platform = getPlatformName(tasks[0] || '');
-        console.log(`${COLORS.Y}${index + 1}.${COLORS.X} ${COLORS.W}${name}${COLORS.X}${COLORS.B} [${platform}]${COLORS.X}`);
+        const tasks = getTasks(q);
+        const taskKeys = tasks ? Object.keys(tasks) : [];
+        const platform = getPlatformName(taskKeys[0] || '');
+        const orbs = getOrbsFromQuest(q);
+        const orbsDisplay = orbs > 0 ? `${COLORS.Y}${orbs} Orbs${COLORS.X}` : `${COLORS.R}No Orbs${COLORS.X}`;
+        console.log(`${COLORS.Y}${index + 1}.${COLORS.X} ${COLORS.W}${name}${COLORS.X} ${COLORS.B}[${platform}]${COLORS.X} ${COLORS.G}|${COLORS.X} ${orbsDisplay}`);
     });
     
     console.log();
@@ -327,12 +399,21 @@ async function listQuests(quests) {
 
 async function processQuestSequential(quest) {
     let q = quest;
-    const questName = q.config.messages.quest_name;
-    const tasks = Object.keys(q.config.task_config.tasks);
-    const platform = getPlatformForTask(tasks[0] || '');
+    const questName = q.config?.messages?.quest_name || 'Unknown Quest';
+    const orbs = getOrbsFromQuest(q);
+
+    const tasks = getTasks(q);
+    if (!tasks) {
+        log('R', `${COLORS.W}${questName}${COLORS.X} ${COLORS.R}Skipped: No valid tasks found${COLORS.X}`);
+        return;
+    }
+
+    const taskKeys = Object.keys(tasks);
+    const platform = getPlatformForTask(taskKeys[0] || '');
+    const platformName = getPlatformName(taskKeys[0] || '');
 
     if (!q.user_status?.enrolled_at) {
-        log('Y', `${COLORS.B}Enrolling${COLORS.X} in ${COLORS.W}${questName}${COLORS.X} ${COLORS.B}[${getPlatformName(tasks[0] || '')}]${COLORS.X}`);
+        log('Y', `${COLORS.B}Enrolling${COLORS.X} in ${COLORS.W}${questName}${COLORS.X} ${COLORS.Y}[${orbs} Orbs]${COLORS.X} ${COLORS.B}[${platformName}]${COLORS.X}`);
         await enroll(q.id, platform);
     }
 
@@ -340,9 +421,12 @@ async function processQuestSequential(quest) {
         q = await getFreshQuest(q.id);
         if (!q || q.user_status?.completed_at) break;
 
-        const tasks = Object.keys(q.config.task_config.tasks);
-        const pending = tasks.filter(t => {
-            const need = q.config.task_config.tasks[t].target;
+        const currentTasks = getTasks(q);
+        if (!currentTasks) break;
+
+        const currentTaskKeys = Object.keys(currentTasks);
+        const pending = currentTaskKeys.filter(t => {
+            const need = currentTasks[t].target;
             const done = q.user_status?.progress?.[t]?.value || 0;
             return done < need;
         });
@@ -354,19 +438,26 @@ async function processQuestSequential(quest) {
         await sleep(3000);
     }
 
-    log('G', `${COLORS.W}${questName}${COLORS.X} ${COLORS.G}fully completed${COLORS.X}`);
+    log('G', `${COLORS.W}${questName}${COLORS.X} ${COLORS.G}fully completed${COLORS.X} ${COLORS.Y}[${orbs} Orbs earned]${COLORS.X}`);
 }
 
 async function processAllQuestsParallel(quests) {
     log('Y', `${COLORS.C}Found ${COLORS.G}${quests.length}${COLORS.C} quests for ${COLORS.M}parallel${COLORS.C} processing${COLORS.X}`);
+    
+    let totalOrbs = 0;
+    quests.forEach(q => {
+        totalOrbs += getOrbsFromQuest(q);
+    });
+    log('Y', `${COLORS.Y}Total potential Orbs: ${COLORS.G}${totalOrbs}${COLORS.X}`);
     log('R', `${COLORS.Y}WARNING: ${COLORS.R}Parallel processing may cause rate limiting or bans!${COLORS.X}`);
 
     const enrollPromises = quests.map(async (q) => {
-        if (!q.user_status?.enrolled_at) {
+        const tasks = getTasks(q);
+        if (!q.user_status?.enrolled_at && tasks) {
             try {
-                const tasks = Object.keys(q.config.task_config.tasks);
-                const platform = getPlatformForTask(tasks[0] || '');
-                const platformName = getPlatformName(tasks[0] || '');
+                const taskKeys = Object.keys(tasks);
+                const platform = getPlatformForTask(taskKeys[0] || '');
+                const platformName = getPlatformName(taskKeys[0] || '');
                 log('Y', `${COLORS.B}Enrolling${COLORS.X} in ${COLORS.W}${q.config.messages.quest_name}${COLORS.X} ${COLORS.B}[${platformName}]${COLORS.X}`);
                 await enroll(q.id, platform);
             } catch {}
@@ -383,7 +474,7 @@ async function processAllQuestsParallel(quests) {
     );
 
     const processPromises = freshQuests.map(async (q) => {
-        const questName = q.config.messages.quest_name;
+        const questName = q.config?.messages?.quest_name;
         let currentQ = q;
         
         while (true) {
@@ -393,9 +484,12 @@ async function processAllQuestsParallel(quests) {
                     break;
                 }
 
-                const tasks = Object.keys(currentQ.config.task_config.tasks);
-                const pending = tasks.filter(t => {
-                    const need = currentQ.config.task_config.tasks[t].target;
+                const tasks = getTasks(currentQ);
+                if (!tasks) break;
+
+                const taskKeys = Object.keys(tasks);
+                const pending = taskKeys.filter(t => {
+                    const need = tasks[t].target;
                     const done = currentQ.user_status?.progress?.[t]?.value || 0;
                     return done < need;
                 });
@@ -452,7 +546,12 @@ async function main() {
                     new Date(q.config.expires_at) > new Date()
                 );
 
-                log('Y', `${COLORS.C}Found ${COLORS.G}${quests.length}${COLORS.C} quests${COLORS.X}`);
+                let totalOrbs = 0;
+                quests.forEach(q => {
+                    totalOrbs += getOrbsFromQuest(q);
+                });
+
+                log('Y', `${COLORS.C}Found ${COLORS.G}${quests.length}${COLORS.C} quests ${COLORS.Y}[Total: ${totalOrbs} Orbs]${COLORS.X}`);
                 
                 for (const q of quests) {
                     await processQuestSequential(q);
@@ -480,6 +579,7 @@ async function main() {
             } else if (choice === '3') {
                 while (true) {
                     const data = await fetchQuests();
+
                     const quests = (data.quests || []).filter(q =>
                         !q.user_status?.completed_at &&
                         new Date(q.config.expires_at) > new Date()
@@ -510,6 +610,8 @@ async function main() {
                     }
 
                     const selectedQuest = quests[questIndex];
+                    const orbs = getOrbsFromQuest(selectedQuest);
+                    log('Y', `${COLORS.C}Selected: ${COLORS.W}${selectedQuest.config.messages.quest_name}${COLORS.X} ${COLORS.Y}[${orbs} Orbs]${COLORS.X}`);
                     await processQuestSequential(selectedQuest);
                     
                     log('G', `${COLORS.C}Quest ${COLORS.G}completed successfully${COLORS.X}`);
