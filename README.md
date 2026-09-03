@@ -1,3 +1,5 @@
+# Use it ur OWN RISK
+
 # Discord Quest Fucker
 
 Discord Quest Fucker is a Node.js CLI tool that automates Discord Quests completion via Discord API v10.
